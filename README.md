@@ -85,6 +85,7 @@ echo '{"x":1}' | jq .
 | `sideapt remove-repo <name>...` | Remove a repo's `.list`/`.sources` and matching key |
 | `sideapt env` | Print shell snippet for `eval "$(sideapt env)"` |
 | `sideapt clean` | Remove cached `.deb` archives |
+| `sideapt self-update` | Replace `sideapt` itself with the latest upstream version |
 | `sideapt help` | Show usage |
 
 ## Adding repositories
@@ -130,6 +131,28 @@ sideapt remove-repo docker      # removes both .list and the matching key
 - Set `SIDEAPT_ROOT` to override the install location (default `~/.sideapt`).
 - Set `PREFIX` when running `make install` to control where the wrapper itself
   is installed (default `~/.local`).
+
+### Self-update
+
+`sideapt` checks for upstream updates once per day (best-effort, time-limited)
+and prints a one-line notice to stderr if a newer version of the script is
+available. To upgrade, run:
+
+```bash
+sideapt self-update
+```
+
+The script atomically replaces itself with the version at
+`https://raw.githubusercontent.com/kqnade/sideapt/main/bin/sideapt`. If the
+script lives in a path you can't write to (e.g. installed system-wide), it
+prints the downloaded path and the `sudo install` line to run instead.
+
+Environment knobs:
+
+- `SIDEAPT_SKIP_UPDATE_CHECK=1` — disable the daily background check.
+- `SIDEAPT_SELF_UPDATE_URL=...` — override the upstream URL (e.g. a fork).
+- `SIDEAPT_SELF_UPDATE_INTERVAL=86400` — seconds between background checks.
+- `SIDEAPT_SELF_UPDATE_TIMEOUT=5` — `curl`/`wget` timeout, in seconds.
 
 ## Troubleshooting
 

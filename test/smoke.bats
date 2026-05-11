@@ -196,3 +196,44 @@ fake_init() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"no such repo"* ]]
 }
+
+# ---- self-update ----
+
+@test "help mentions self-update" {
+    run "$SIDEAPT" help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"self-update"* ]]
+}
+
+@test "self-update fails fast on unreachable URL" {
+    command -v curl >/dev/null || command -v wget >/dev/null || skip "needs curl or wget"
+    run env SIDEAPT_SELF_UPDATE_URL="http://127.0.0.1:1/nope" \
+            SIDEAPT_SELF_UPDATE_TIMEOUT=1 \
+            "$SIDEAPT" self-update
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"download failed"* ]]
+}
+
+@test "self-update rejects a payload that doesn't look like sideapt" {
+    command -v curl >/dev/null || skip "needs curl (for file:// fetch)"
+    local bogus="$SIDEAPT_ROOT/bogus"
+    mkdir -p "$SIDEAPT_ROOT"
+    printf 'hello world\n' > "$bogus"
+    run env SIDEAPT_SELF_UPDATE_URL="file://$bogus" \
+            SIDEAPT_SELF_UPDATE_TIMEOUT=2 \
+            "$SIDEAPT" self-update
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"does not look like sideapt"* ]]
+}
+
+@test "SIDEAPT_SKIP_UPDATE_CHECK suppresses background update check" {
+    fake_init
+    # Even with an obviously broken URL, no fetch attempt should happen,
+    # and no last-update-check marker should be created.
+    run env SIDEAPT_SKIP_UPDATE_CHECK=1 \
+            SIDEAPT_SELF_UPDATE_URL="http://127.0.0.1:1/nope" \
+            SIDEAPT_SELF_UPDATE_TIMEOUT=1 \
+            "$SIDEAPT" list
+    [ "$status" -eq 0 ]
+    [ ! -f "$SIDEAPT_ROOT/db/last-update-check" ]
+}
