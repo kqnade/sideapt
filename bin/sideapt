@@ -14,6 +14,8 @@ FILES_DIR="$DB_DIR/files"
 SOURCES_LIST_D="$SIDEAPT_ROOT/apt/etc/apt/sources.list.d"
 KEYRINGS_DIR="$SIDEAPT_ROOT/apt/etc/apt/keyrings"
 LAST_UPDATE_CHECK_FILE="$DB_DIR/last-update-check"
+LOCK_FILE="$DB_DIR/.lock"
+LOCK_WAIT_SEC="${SIDEAPT_LOCK_WAIT:-30}"
 
 SELF_UPDATE_URL="${SIDEAPT_SELF_UPDATE_URL:-https://raw.githubusercontent.com/kqnade/sideapt/main/bin/sideapt}"
 SELF_UPDATE_INTERVAL_SEC="${SIDEAPT_SELF_UPDATE_INTERVAL:-86400}"
@@ -28,6 +30,21 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found:
 
 ensure_initialized() {
     [[ -f "$APT_CONFIG_FILE" ]] || die "not initialized; run 'sideapt init' first"
+}
+
+# Acquire an exclusive advisory lock for write operations. No-op (with a
+# warning) if flock(1) is unavailable. The FD stays open for the process
+# lifetime so the lock is automatically released on exit.
+with_lock() {
+    mkdir -p "$DB_DIR"
+    if ! command -v flock >/dev/null 2>&1; then
+        log "warning: 'flock' not found; concurrent runs are unprotected"
+        return 0
+    fi
+    exec {SIDEAPT_LOCK_FD}>"$LOCK_FILE"
+    if ! flock -w "$LOCK_WAIT_SEC" -x "$SIDEAPT_LOCK_FD"; then
+        die "another sideapt instance is holding $LOCK_FILE (waited ${LOCK_WAIT_SEC}s)"
+    fi
 }
 
 apt_env() { APT_CONFIG="$APT_CONFIG_FILE" "$@"; }
@@ -574,6 +591,101 @@ cmd_clean() {
     log "archive cache cleaned"
 }
 
+cmd_info() {
+    ensure_initialized
+    [[ $# -ge 1 ]] || die "usage: sideapt info <pkg>..."
+    local first=1
+    local exit_code=0
+    for pkg in "$@"; do
+        if [[ $first -eq 1 ]]; then first=0; else printf '\n'; fi
+        if ! is_installed_in_sideapt "$pkg"; then
+            log "not installed in sideapt: $pkg"
+            exit_code=1
+            continue
+        fi
+        local line name version installed kind
+        line=$(grep "^${pkg}	" "$INSTALLED_TSV" | head -n1)
+        IFS=$'\t' read -r name version installed kind <<< "$line"
+        printf 'Package:   %s\n' "$name"
+        printf 'Version:   %s\n' "$version"
+        printf 'Installed: %s\n' "$installed"
+        printf 'Type:      %s\n' "$kind"
+        local list="$FILES_DIR/$name.list"
+        if [[ -f "$list" ]]; then
+            local count
+            count=$(wc -l < "$list" | tr -d ' ')
+            printf 'Files:     %s\n' "$count"
+            sed 's|^|  /|' "$list"
+        else
+            printf 'Files:     (no file list recorded)\n'
+        fi
+    done
+    return $exit_code
+}
+
+# Show packages installed as 'auto' that are no longer required by any
+# 'requested' package's recursive dependency closure. With --remove (or -r),
+# remove them via cmd_remove. Without arguments, print one name per line.
+cmd_orphans() {
+    ensure_initialized
+    local mode=list
+    case "${1:-}" in
+        --remove|-r) mode=remove ;;
+        '') ;;
+        *) die "usage: sideapt orphans [--remove|-r]" ;;
+    esac
+
+    [[ -s "$INSTALLED_TSV" ]] || { log "nothing installed"; return 0; }
+
+    local requested_pkgs=() auto_pkgs=()
+    while IFS=$'\t' read -r name _version _installed kind; do
+        [[ -z "$name" ]] && continue
+        case "$kind" in
+            requested) requested_pkgs+=("$name") ;;
+            auto)      auto_pkgs+=("$name") ;;
+        esac
+    done < "$INSTALLED_TSV"
+
+    if [[ ${#auto_pkgs[@]} -eq 0 ]]; then
+        log "no auto-installed packages"
+        return 0
+    fi
+
+    # No 'requested' anchors -> everything auto is an orphan.
+    local orphans=()
+    if [[ ${#requested_pkgs[@]} -eq 0 ]]; then
+        orphans=("${auto_pkgs[@]}")
+    else
+        local -A needed=()
+        local r d deps
+        for r in "${requested_pkgs[@]}"; do
+            needed[$r]=1
+            deps=$(resolve_deps "$r")
+            while IFS= read -r d; do
+                [[ -n "$d" ]] && needed[$d]=1
+            done <<< "$deps"
+        done
+        local a
+        for a in "${auto_pkgs[@]}"; do
+            [[ -z "${needed[$a]+x}" ]] && orphans+=("$a")
+        done
+    fi
+
+    if [[ ${#orphans[@]} -eq 0 ]]; then
+        log "no orphans"
+        return 0
+    fi
+
+    if [[ "$mode" = remove ]]; then
+        log "removing ${#orphans[@]} orphan(s): ${orphans[*]}"
+        cmd_remove "${orphans[@]}"
+    else
+        local o
+        for o in "${orphans[@]}"; do printf '%s\n' "$o"; done
+        log "${#orphans[@]} orphan(s); run 'sideapt orphans --remove' to clean up"
+    fi
+}
+
 # ---------- self-update ----------
 
 # Resolve the on-disk path of this script (handles symlinks).
@@ -698,6 +810,8 @@ Commands:
   install <pkg>...    Download .debs and extract under ~/.sideapt/usr
   remove <pkg>...     Remove packages (refcount-aware)
   list                List installed packages
+  info <pkg>...       Show package details and file list
+  orphans [--remove]  List (or remove) auto-installed packages no longer needed
   upgrade             Upgrade installed packages
   add-repo <spec>     Add a repository. Forms:
                         sideapt add-repo ppa:USER/NAME [SUITE]
@@ -713,6 +827,8 @@ Commands:
 
 Override location with SIDEAPT_ROOT (default ~/.sideapt).
 Disable the daily update-available check with SIDEAPT_SKIP_UPDATE_CHECK=1.
+Concurrent write ops are serialized via flock on ~/.sideapt/db/.lock
+(timeout SIDEAPT_LOCK_WAIT, default 30s).
 EOF
 }
 
@@ -727,6 +843,17 @@ main() {
         *) maybe_notify_self_update ;;
     esac
 
+    # Acquire the write lock for state-mutating subcommands.
+    case "$cmd" in
+        install|remove|uninstall|update|upgrade|clean|\
+        add-repo|add-key|remove-repo|\
+        self-update|self_update|selfupdate|orphans)
+            if [[ -f "$APT_CONFIG_FILE" ]]; then
+                with_lock
+            fi
+            ;;
+    esac
+
     case "$cmd" in
         init)                            cmd_init "$@" ;;
         update)                          cmd_update "$@" ;;
@@ -734,6 +861,8 @@ main() {
         install)                         cmd_install "$@" ;;
         remove|uninstall)                cmd_remove "$@" ;;
         list|ls)                         cmd_list "$@" ;;
+        info|show)                       cmd_info "$@" ;;
+        orphans|autoremove)              cmd_orphans "$@" ;;
         upgrade)                         cmd_upgrade "$@" ;;
         add-repo)                        cmd_add_repo "$@" ;;
         add-key)                         cmd_add_key "$@" ;;

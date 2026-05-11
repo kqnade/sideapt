@@ -77,6 +77,8 @@ echo '{"x":1}' | jq .
 | `sideapt install <pkg>...` | Resolve deps, download, extract, regenerate symlinks |
 | `sideapt remove <pkg>...` | Remove packages (refcount-aware: shared files survive) |
 | `sideapt list` | List installed packages with version and install type |
+| `sideapt info <pkg>...` | Show package details and the files it owns |
+| `sideapt orphans [--remove]` | List or remove auto-installed packages no longer required |
 | `sideapt upgrade` | Re-install all `requested` packages to pull current versions |
 | `sideapt add-repo ppa:USER/NAME [suite]` | Add a Launchpad PPA (auto-fetches signing key) |
 | `sideapt add-repo NAME 'deb [...] URL SUITE COMP...'` | Add an arbitrary apt repository |
@@ -153,6 +155,14 @@ Environment knobs:
 - `SIDEAPT_SELF_UPDATE_URL=...` — override the upstream URL (e.g. a fork).
 - `SIDEAPT_SELF_UPDATE_INTERVAL=86400` — seconds between background checks.
 - `SIDEAPT_SELF_UPDATE_TIMEOUT=5` — `curl`/`wget` timeout, in seconds.
+
+### Concurrency
+
+Write operations (`install`, `remove`, `update`, `upgrade`, `clean`, `add-*`,
+`remove-repo`, `self-update`, `orphans`) take an exclusive `flock(2)` advisory
+lock on `~/.sideapt/db/.lock`. A second `sideapt` invocation will wait up to
+`SIDEAPT_LOCK_WAIT` seconds (default `30`) before erroring out. Read-only
+commands (`list`, `info`, `search`, `list-repos`, `env`, `help`) take no lock.
 
 ## Troubleshooting
 

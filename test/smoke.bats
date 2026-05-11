@@ -237,3 +237,92 @@ fake_init() {
     [ "$status" -eq 0 ]
     [ ! -f "$SIDEAPT_ROOT/db/last-update-check" ]
 }
+
+# ---- info ----
+
+@test "help mentions info and orphans" {
+    run "$SIDEAPT" help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"info "* ]]
+    [[ "$output" == *"orphans"* ]]
+}
+
+@test "info on a fake installed package shows fields and files" {
+    fake_init
+    printf 'jq\t1.6-2\t2026-05-11T00:00:00+00:00\trequested\n' > "$SIDEAPT_ROOT/db/installed.tsv"
+    printf 'usr/bin/jq\nusr/share/doc/jq/copyright\n' > "$SIDEAPT_ROOT/db/files/jq.list"
+    run env SIDEAPT_SKIP_UPDATE_CHECK=1 "$SIDEAPT" info jq
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Package:   jq"* ]]
+    [[ "$output" == *"Version:   1.6-2"* ]]
+    [[ "$output" == *"Type:      requested"* ]]
+    [[ "$output" == *"Files:     2"* ]]
+    [[ "$output" == *"/usr/bin/jq"* ]]
+}
+
+@test "info on an unknown package fails softly" {
+    fake_init
+    : > "$SIDEAPT_ROOT/db/installed.tsv"
+    run env SIDEAPT_SKIP_UPDATE_CHECK=1 "$SIDEAPT" info nope
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not installed in sideapt: nope"* ]]
+}
+
+# ---- orphans ----
+
+@test "orphans says nothing on an empty installed.tsv" {
+    fake_init
+    run env SIDEAPT_SKIP_UPDATE_CHECK=1 "$SIDEAPT" orphans
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"nothing installed"* ]]
+}
+
+@test "orphans treats every auto package as orphan when no requested anchors" {
+    fake_init
+    {
+        printf 'libfoo\t1.0\t2026-05-11T00:00:00+00:00\tauto\n'
+        printf 'libbar\t2.0\t2026-05-11T00:00:00+00:00\tauto\n'
+    } > "$SIDEAPT_ROOT/db/installed.tsv"
+    run env SIDEAPT_SKIP_UPDATE_CHECK=1 "$SIDEAPT" orphans
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"libfoo"* ]]
+    [[ "$output" == *"libbar"* ]]
+}
+
+@test "orphans says 'no auto-installed' when everything is requested" {
+    fake_init
+    printf 'jq\t1.6-2\t2026-05-11T00:00:00+00:00\trequested\n' > "$SIDEAPT_ROOT/db/installed.tsv"
+    run env SIDEAPT_SKIP_UPDATE_CHECK=1 "$SIDEAPT" orphans
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"no auto-installed packages"* ]]
+}
+
+@test "orphans rejects an unknown flag" {
+    fake_init
+    run env SIDEAPT_SKIP_UPDATE_CHECK=1 "$SIDEAPT" orphans --bogus
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"usage"* ]]
+}
+
+# ---- lockfile ----
+
+@test "second sideapt blocks while first holds the write lock" {
+    command -v flock >/dev/null || skip "flock not available on this host"
+    fake_init
+    # Hold the lock from a background shell.
+    (
+        exec 9>"$SIDEAPT_ROOT/db/.lock"
+        flock -x 9
+        sleep 2
+    ) &
+    local holder=$!
+    sleep 0.2
+    SECONDS=0
+    run env SIDEAPT_SKIP_UPDATE_CHECK=1 SIDEAPT_LOCK_WAIT=1 "$SIDEAPT" clean
+    local elapsed=$SECONDS
+    wait "$holder" 2>/dev/null || true
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"another sideapt instance"* ]]
+    # Should have waited ~1s, not 0 and not full 2s.
+    [ "$elapsed" -ge 1 ]
+}
