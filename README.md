@@ -78,9 +78,40 @@ echo '{"x":1}' | jq .
 | `sideapt remove <pkg>...` | Remove packages (refcount-aware: shared files survive) |
 | `sideapt list` | List installed packages with version and install type |
 | `sideapt upgrade` | Re-install all `requested` packages to pull current versions |
+| `sideapt add-repo ppa:USER/NAME [suite]` | Add a Launchpad PPA (auto-fetches signing key) |
+| `sideapt add-repo NAME 'deb [...] URL SUITE COMP...'` | Add an arbitrary apt repository |
+| `sideapt add-key NAME <URL\|file>` | Import a signing key into `~/.sideapt/apt/etc/apt/keyrings/` |
+| `sideapt list-repos` | List configured repositories |
+| `sideapt remove-repo <name>...` | Remove a repo's `.list`/`.sources` and matching key |
 | `sideapt env` | Print shell snippet for `eval "$(sideapt env)"` |
 | `sideapt clean` | Remove cached `.deb` archives |
 | `sideapt help` | Show usage |
+
+## Adding repositories
+
+`sideapt` writes repository files under `~/.sideapt/apt/etc/apt/sources.list.d/`
+and stores signing keys (dearmored) under
+`~/.sideapt/apt/etc/apt/keyrings/`. The generated source lines use
+`signed-by=` so each key is trusted only for the repository that imported it.
+
+```bash
+# Launchpad PPA — fetches the signing key from Launchpad + keyserver.ubuntu.com,
+# auto-detects the release codename (override by passing a suite argument).
+sideapt add-repo ppa:neovim-ppa/unstable
+sideapt update
+sideapt install neovim
+
+# Arbitrary repository — import the key first, then add the deb line.
+# (If a key with the same NAME already exists, signed-by= is auto-attached.)
+sideapt add-key docker https://download.docker.com/linux/ubuntu/gpg
+sideapt add-repo docker 'deb https://download.docker.com/linux/ubuntu jammy stable'
+
+# Inspect / remove
+sideapt list-repos
+sideapt remove-repo docker      # removes both .list and the matching key
+```
+
+`add-repo` (PPA form) and `add-key` require `curl` (or `wget`) and `gpg`.
 
 ## Directory layout
 

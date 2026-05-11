@@ -11,6 +11,8 @@ ARCHIVES_DIR="$SIDEAPT_ROOT/var/cache/sideapt/archives"
 DB_DIR="$SIDEAPT_ROOT/db"
 INSTALLED_TSV="$DB_DIR/installed.tsv"
 FILES_DIR="$DB_DIR/files"
+SOURCES_LIST_D="$SIDEAPT_ROOT/apt/etc/apt/sources.list.d"
+KEYRINGS_DIR="$SIDEAPT_ROOT/apt/etc/apt/keyrings"
 
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)"
@@ -65,6 +67,46 @@ resolve_deps() {
         | sort -u
 }
 
+# ---------- repo helpers ----------
+
+# Validate a name component (repo name, PPA user, PPA name) — strict to avoid
+# path traversal and weird filenames in sources.list.d / keyrings.
+valid_name_part() {
+    [[ "$1" =~ ^[A-Za-z0-9._+-]+$ ]]
+}
+
+# Detect Ubuntu/Debian release codename (jammy, noble, bookworm, ...).
+detect_suite() {
+    if command -v lsb_release >/dev/null 2>&1; then
+        local s; s="$(lsb_release -cs 2>/dev/null)" || true
+        [[ -n "$s" ]] && { printf '%s\n' "$s"; return 0; }
+    fi
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        ( . /etc/os-release && [[ -n "${VERSION_CODENAME:-}" ]] && printf '%s\n' "$VERSION_CODENAME" ) && return 0
+    fi
+    return 1
+}
+
+# Fetch a URL to stdout. Prefers curl, falls back to wget.
+fetch_url() {
+    local url="$1"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "$url"
+    else
+        die "need curl or wget to fetch $url"
+    fi
+}
+
+# Read armored or binary key from stdin, write a binary keyring to $1.
+dearmor_to() {
+    local out="$1"
+    mkdir -p "$(dirname "$out")"
+    gpg --dearmor --yes -o "$out" 2>/dev/null
+}
+
 # ---------- subcommands ----------
 
 cmd_init() {
@@ -79,6 +121,7 @@ cmd_init() {
         "$ARCHIVES_DIR" \
         "$SIDEAPT_ROOT/apt/etc/apt/sources.list.d" \
         "$SIDEAPT_ROOT/apt/etc/apt/trusted.gpg.d" \
+        "$KEYRINGS_DIR" \
         "$SIDEAPT_ROOT/apt/etc/apt/preferences.d" \
         "$SIDEAPT_ROOT/apt/etc/apt/apt.conf.d" \
         "$SIDEAPT_ROOT/apt/var/lib/apt/lists/partial" \
@@ -350,6 +393,158 @@ cmd_upgrade() {
     cmd_install "${requested_pkgs[@]}"
 }
 
+cmd_add_repo() {
+    ensure_initialized
+    [[ $# -ge 1 ]] || die "usage:
+  sideapt add-repo ppa:USER/NAME [SUITE]
+  sideapt add-repo NAME 'deb [opts] URL SUITE COMPONENT...'"
+
+    local first="$1"; shift
+
+    # ---- PPA form ----
+    if [[ "$first" == ppa:* ]]; then
+        local spec="${first#ppa:}"
+        local ppa_user="${spec%%/*}"
+        local ppa_name="${spec#*/}"
+        [[ -n "$ppa_user" && -n "$ppa_name" && "$ppa_user" != "$spec" ]] \
+            || die "bad PPA spec: $first (expected ppa:USER/NAME)"
+        valid_name_part "$ppa_user" || die "invalid PPA user: $ppa_user"
+        valid_name_part "$ppa_name" || die "invalid PPA name: $ppa_name"
+
+        local suite="${1:-}"
+        if [[ -z "$suite" ]]; then
+            suite="$(detect_suite)" || die "could not detect release codename; pass it explicitly: sideapt add-repo $first <suite>"
+        fi
+
+        need_cmd gpg
+
+        local stem="${ppa_user}-ubuntu-${ppa_name}"
+        local list_file="$SOURCES_LIST_D/${stem}.list"
+        local key_file="$KEYRINGS_DIR/${stem}.gpg"
+        [[ -e "$list_file" ]] && die "already exists: $list_file (try 'sideapt remove-repo $stem')"
+
+        log "fetching Launchpad metadata for ppa:$ppa_user/$ppa_name"
+        local meta
+        meta="$(fetch_url "https://launchpad.net/api/1.0/~$ppa_user/+archive/ubuntu/$ppa_name")" \
+            || die "could not reach Launchpad API for ppa:$ppa_user/$ppa_name"
+
+        local fp
+        fp="$(printf '%s' "$meta" \
+            | grep -oE '"signing_key_fingerprint"[[:space:]]*:[[:space:]]*"[^"]+"' \
+            | head -n1 \
+            | sed 's/.*"\([^"]*\)"$/\1/')"
+        [[ -n "$fp" ]] || die "no signing_key_fingerprint in Launchpad response (does the PPA exist?)"
+
+        log "fetching signing key 0x$fp"
+        fetch_url "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${fp}" \
+            | dearmor_to "$key_file" \
+            || die "failed to import key $fp"
+        chmod 0644 "$key_file"
+
+        local url="https://ppa.launchpadcontent.net/$ppa_user/$ppa_name/ubuntu"
+        printf 'deb [signed-by=%s] %s %s main\n' "$key_file" "$url" "$suite" > "$list_file"
+
+        log "added: $list_file"
+        log "key:   $key_file"
+        log "run 'sideapt update' to fetch the index"
+        return 0
+    fi
+
+    # ---- Raw deb-line form ----
+    local name="$first"
+    valid_name_part "$name" || die "invalid repo name: $name (allowed: A-Z a-z 0-9 . _ + -)"
+    [[ $# -ge 1 ]] || die "usage: sideapt add-repo $name 'deb [opts] URL SUITE COMP...'"
+
+    local line="$1"
+    [[ "$line" =~ ^deb([[:space:]]|$) ]] || die "expected a line starting with 'deb ' (got: $line)"
+
+    local list_file="$SOURCES_LIST_D/${name}.list"
+    local key_file="$KEYRINGS_DIR/${name}.gpg"
+    [[ -e "$list_file" ]] && die "already exists: $list_file"
+
+    # If a matching key was already imported via 'add-key NAME ...' and the
+    # caller didn't supply their own signed-by=, splice it in.
+    if [[ -f "$key_file" && "$line" != *"signed-by="* ]]; then
+        if [[ "$line" == deb\ \[* ]]; then
+            line="${line/deb \[/deb [signed-by=$key_file }"
+        else
+            line="deb [signed-by=$key_file] ${line#deb }"
+        fi
+        log "auto-attached keyring: $key_file"
+    fi
+
+    printf '%s\n' "$line" > "$list_file"
+    log "added: $list_file"
+    if [[ ! -f "$key_file" && "$line" != *"signed-by="* ]]; then
+        log "note: no signing key attached; if apt rejects this repo, run 'sideapt add-key $name <URL|file>'"
+    fi
+}
+
+cmd_add_key() {
+    ensure_initialized
+    [[ $# -eq 2 ]] || die "usage: sideapt add-key NAME <URL|file>"
+    need_cmd gpg
+
+    local name="$1" src="$2"
+    valid_name_part "$name" || die "invalid key name: $name (allowed: A-Z a-z 0-9 . _ + -)"
+
+    mkdir -p "$KEYRINGS_DIR"
+    local out="$KEYRINGS_DIR/${name}.gpg"
+    [[ -e "$out" ]] && die "already exists: $out (run 'sideapt remove-repo $name' to clear it first)"
+
+    if [[ "$src" =~ ^https?:// ]]; then
+        log "fetching key from $src"
+        fetch_url "$src" | dearmor_to "$out" || die "failed to import key from $src"
+    elif [[ -f "$src" ]]; then
+        dearmor_to "$out" < "$src" || die "failed to dearmor $src"
+    else
+        die "key source not found: $src (expected http(s):// URL or local file)"
+    fi
+    [[ -s "$out" ]] || { rm -f "$out"; die "imported key is empty; source may not be a valid PGP key"; }
+    chmod 0644 "$out"
+    log "imported: $out"
+    log "reference it in a deb line with: [signed-by=$out]"
+}
+
+cmd_list_repos() {
+    ensure_initialized
+    local any=0
+    local f base
+    shopt -s nullglob
+    for f in "$SOURCES_LIST_D"/*.list "$SOURCES_LIST_D"/*.sources; do
+        base="$(basename "$f")"
+        printf '== %s ==\n' "$base"
+        # Show non-comment, non-blank lines indented
+        grep -vE '^[[:space:]]*(#|$)' "$f" | sed 's/^/  /' || true
+        any=1
+    done
+    shopt -u nullglob
+    [[ $any -eq 1 ]] || log "no repositories configured"
+}
+
+cmd_remove_repo() {
+    ensure_initialized
+    [[ $# -ge 1 ]] || die "usage: sideapt remove-repo <name>..."
+    for name in "$@"; do
+        if ! valid_name_part "$name"; then
+            log "skip invalid name: $name"
+            continue
+        fi
+        local list_file="$SOURCES_LIST_D/${name}.list"
+        local sources_file="$SOURCES_LIST_D/${name}.sources"
+        local key_file="$KEYRINGS_DIR/${name}.gpg"
+        local removed=0
+        for f in "$list_file" "$sources_file" "$key_file"; do
+            if [[ -f "$f" ]]; then
+                rm -f "$f"
+                log "removed: $f"
+                removed=1
+            fi
+        done
+        [[ $removed -eq 1 ]] || log "no such repo: $name"
+    done
+}
+
 cmd_env() {
     cat <<EOF
 export SIDEAPT_ROOT="$SIDEAPT_ROOT"
@@ -383,6 +578,12 @@ Commands:
   remove <pkg>...     Remove packages (refcount-aware)
   list                List installed packages
   upgrade             Upgrade installed packages
+  add-repo <spec>     Add a repository. Forms:
+                        sideapt add-repo ppa:USER/NAME [SUITE]
+                        sideapt add-repo NAME 'deb [opts] URL SUITE COMP...'
+  add-key NAME <src>  Import a signing key (URL or local file) into keyrings/
+  list-repos          List configured repositories
+  remove-repo <name>  Remove a repo's .list/.sources and matching key
   env                 Print shell snippet for activation:
                         eval "$(sideapt env)"
   clean               Remove cached .deb archives
@@ -403,6 +604,10 @@ main() {
         remove|uninstall) cmd_remove "$@" ;;
         list|ls)          cmd_list "$@" ;;
         upgrade)          cmd_upgrade "$@" ;;
+        add-repo)         cmd_add_repo "$@" ;;
+        add-key)          cmd_add_key "$@" ;;
+        list-repos)       cmd_list_repos "$@" ;;
+        remove-repo)      cmd_remove_repo "$@" ;;
         env)              cmd_env "$@" ;;
         clean)            cmd_clean "$@" ;;
         help|-h|--help)   usage ;;

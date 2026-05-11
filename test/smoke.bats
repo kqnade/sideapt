@@ -80,3 +80,119 @@ teardown() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"not installed"* ]]
 }
+
+# Tests below skip cmd_init's hard apt-get/gpg dependency by faking the
+# layout, so they can run on any host (CI, mac, restricted containers).
+fake_init() {
+    mkdir -p \
+        "$SIDEAPT_ROOT/apt/etc/apt/sources.list.d" \
+        "$SIDEAPT_ROOT/apt/etc/apt/keyrings" \
+        "$SIDEAPT_ROOT/db/files" \
+        "$SIDEAPT_ROOT/var/cache/sideapt/archives"
+    touch "$SIDEAPT_ROOT/db/installed.tsv" "$SIDEAPT_ROOT/apt/apt.conf"
+}
+
+@test "init creates keyrings directory" {
+    run "$SIDEAPT" init
+    if [ "$status" -ne 0 ]; then skip "init needs apt-get on host"; fi
+    [ -d "$SIDEAPT_ROOT/apt/etc/apt/keyrings" ]
+}
+
+@test "help lists the new repo subcommands" {
+    run "$SIDEAPT" help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"add-repo"* ]]
+    [[ "$output" == *"add-key"* ]]
+    [[ "$output" == *"list-repos"* ]]
+    [[ "$output" == *"remove-repo"* ]]
+}
+
+@test "add-repo (raw form) writes a .list file" {
+    fake_init
+    run "$SIDEAPT" add-repo myrepo 'deb http://example.com/ubuntu jammy main'
+    [ "$status" -eq 0 ]
+    [ -f "$SIDEAPT_ROOT/apt/etc/apt/sources.list.d/myrepo.list" ]
+    run cat "$SIDEAPT_ROOT/apt/etc/apt/sources.list.d/myrepo.list"
+    [[ "$output" == "deb http://example.com/ubuntu jammy main" ]]
+}
+
+@test "add-repo rejects an invalid name" {
+    fake_init
+    run "$SIDEAPT" add-repo 'bad name' 'deb http://x/ y z'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"invalid repo name"* ]]
+}
+
+@test "add-repo rejects a non-deb line" {
+    fake_init
+    run "$SIDEAPT" add-repo other 'something else'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"deb"* ]]
+}
+
+@test "add-repo rejects duplicates" {
+    fake_init
+    "$SIDEAPT" add-repo myrepo 'deb http://example.com/ubuntu jammy main'
+    run "$SIDEAPT" add-repo myrepo 'deb http://example.com/ubuntu jammy main'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"already exists"* ]]
+}
+
+@test "add-repo rejects a bad ppa spec" {
+    fake_init
+    run "$SIDEAPT" add-repo 'ppa:onlyuser'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"PPA"* ]]
+}
+
+@test "add-repo auto-attaches signed-by= when a matching key exists" {
+    fake_init
+    : > "$SIDEAPT_ROOT/apt/etc/apt/keyrings/withkey.gpg"
+    run "$SIDEAPT" add-repo withkey 'deb http://example.com/ubuntu jammy main'
+    [ "$status" -eq 0 ]
+    run cat "$SIDEAPT_ROOT/apt/etc/apt/sources.list.d/withkey.list"
+    [[ "$output" == *"signed-by=$SIDEAPT_ROOT/apt/etc/apt/keyrings/withkey.gpg"* ]]
+}
+
+@test "add-repo splices signed-by= into an existing [opts] block" {
+    fake_init
+    : > "$SIDEAPT_ROOT/apt/etc/apt/keyrings/withopts.gpg"
+    run "$SIDEAPT" add-repo withopts 'deb [arch=amd64] http://example.com/ubuntu jammy main'
+    [ "$status" -eq 0 ]
+    run cat "$SIDEAPT_ROOT/apt/etc/apt/sources.list.d/withopts.list"
+    [[ "$output" == *"signed-by=$SIDEAPT_ROOT/apt/etc/apt/keyrings/withopts.gpg"* ]]
+    [[ "$output" == *"arch=amd64"* ]]
+}
+
+@test "list-repos shows configured entries" {
+    fake_init
+    "$SIDEAPT" add-repo myrepo 'deb http://example.com/ubuntu jammy main'
+    run "$SIDEAPT" list-repos
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"myrepo.list"* ]]
+    [[ "$output" == *"example.com"* ]]
+}
+
+@test "list-repos says nothing on a fresh root" {
+    fake_init
+    run "$SIDEAPT" list-repos
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"no repositories"* ]]
+}
+
+@test "remove-repo deletes the .list and matching key" {
+    fake_init
+    "$SIDEAPT" add-repo myrepo 'deb http://example.com/ubuntu jammy main'
+    : > "$SIDEAPT_ROOT/apt/etc/apt/keyrings/myrepo.gpg"
+    run "$SIDEAPT" remove-repo myrepo
+    [ "$status" -eq 0 ]
+    [ ! -f "$SIDEAPT_ROOT/apt/etc/apt/sources.list.d/myrepo.list" ]
+    [ ! -f "$SIDEAPT_ROOT/apt/etc/apt/keyrings/myrepo.gpg" ]
+}
+
+@test "remove-repo of unknown name is a soft warning" {
+    fake_init
+    run "$SIDEAPT" remove-repo nope
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"no such repo"* ]]
+}
