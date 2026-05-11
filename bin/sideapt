@@ -127,7 +127,12 @@ cmd_init() {
         "$SIDEAPT_ROOT/apt/var/lib/apt/lists/partial" \
         "$SIDEAPT_ROOT/apt/var/lib/apt/lists/auxfiles" \
         "$SIDEAPT_ROOT/apt/var/lib/apt/periodic" \
+        "$SIDEAPT_ROOT/apt/var/lib/dpkg" \
         "$SIDEAPT_ROOT/apt/var/cache/apt/archives/partial"
+
+    # apt resolves Dir::State::status from Dir::State (../dpkg/status by default).
+    # Without an existing file, apt-get update aborts before fetching indices.
+    touch "$SIDEAPT_ROOT/apt/var/lib/dpkg/status"
 
     touch "$INSTALLED_TSV"
 
