@@ -1,0 +1,7 @@
+*.deb
+test/tmp/
+test/.bats-tmp/
+.vscode/
+.idea/
+*.swp
+*~

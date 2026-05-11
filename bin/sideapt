@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+# sideapt — non-root APT-based application manager
+# Wraps `apt download` + `dpkg-deb -x` to install Debian/Ubuntu packages
+# under ~/.sideapt/usr without root privileges.
+
+set -euo pipefail
+
+SIDEAPT_ROOT="${SIDEAPT_ROOT:-$HOME/.sideapt}"
+APT_CONFIG_FILE="$SIDEAPT_ROOT/apt/apt.conf"
+ARCHIVES_DIR="$SIDEAPT_ROOT/var/cache/sideapt/archives"
+DB_DIR="$SIDEAPT_ROOT/db"
+INSTALLED_TSV="$DB_DIR/installed.tsv"
+FILES_DIR="$DB_DIR/files"
+
+ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)"
+
+die()  { printf 'sideapt: error: %s\n' "$*" >&2; exit 1; }
+log()  { printf 'sideapt: %s\n' "$*" >&2; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+ensure_initialized() {
+    [[ -f "$APT_CONFIG_FILE" ]] || die "not initialized; run 'sideapt init' first"
+}
+
+apt_env() { APT_CONFIG="$APT_CONFIG_FILE" "$@"; }
+
+# ---------- queries ----------
+
+is_installed_system() {
+    dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null \
+        | grep -q '^install ok installed$'
+}
+
+is_installed_in_sideapt() {
+    [[ -f "$INSTALLED_TSV" ]] || return 1
+    grep -q "^${1}	" "$INSTALLED_TSV" 2>/dev/null
+}
+
+# Extract file paths from a .deb (data archive listing).
+# Outputs relative paths like "usr/bin/jq" (no leading "./", directories filtered out).
+deb_file_list() {
+    LC_ALL=C dpkg-deb -c "$1" | awk '
+        {
+            # Reassemble filename starting at field 6 (mode owner size date time name...)
+            s = $6
+            for (i = 7; i <= NF; i++) s = s " " $i
+            # Drop "-> target" suffix for symlinks (we record the link name)
+            sub(/ -> .*$/, "", s)
+            print s
+        }
+    ' | sed 's|^\./||' | grep -v '/$' | grep -v '^$' || true
+}
+
+# Resolve recursive dependencies of a package (real package names, sorted unique).
+# On multi-arch systems apt-cache also walks foreign-arch chains (e.g. perl:i386).
+# We strip foreign-arch entries — bare names resolve to the native arch via apt-get.
+resolve_deps() {
+    apt_env apt-cache depends --recurse \
+        --no-recommends --no-suggests --no-conflicts \
+        --no-breaks --no-replaces --no-enhances \
+        "$1" 2>/dev/null \
+        | grep -E '^[A-Za-z0-9]' \
+        | grep -v ':' \
+        | sort -u
+}
+
+# ---------- subcommands ----------
+
+cmd_init() {
+    need_cmd apt-get
+    need_cmd apt-cache
+    need_cmd dpkg-deb
+    need_cmd dpkg-query
+
+    mkdir -p \
+        "$SIDEAPT_ROOT/usr" \
+        "$FILES_DIR" \
+        "$ARCHIVES_DIR" \
+        "$SIDEAPT_ROOT/apt/etc/apt/sources.list.d" \
+        "$SIDEAPT_ROOT/apt/etc/apt/trusted.gpg.d" \
+        "$SIDEAPT_ROOT/apt/etc/apt/preferences.d" \
+        "$SIDEAPT_ROOT/apt/etc/apt/apt.conf.d" \
+        "$SIDEAPT_ROOT/apt/var/lib/apt/lists/partial" \
+        "$SIDEAPT_ROOT/apt/var/lib/apt/lists/auxfiles" \
+        "$SIDEAPT_ROOT/apt/var/lib/apt/periodic" \
+        "$SIDEAPT_ROOT/apt/var/cache/apt/archives/partial"
+
+    touch "$INSTALLED_TSV"
+
+    if [[ -f /etc/apt/sources.list && ! -e "$SIDEAPT_ROOT/apt/etc/apt/sources.list" ]]; then
+        cp /etc/apt/sources.list "$SIDEAPT_ROOT/apt/etc/apt/sources.list"
+    fi
+    [[ -e "$SIDEAPT_ROOT/apt/etc/apt/sources.list" ]] || : > "$SIDEAPT_ROOT/apt/etc/apt/sources.list"
+
+    if [[ -d /etc/apt/sources.list.d ]]; then
+        find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) \
+            -exec cp -n {} "$SIDEAPT_ROOT/apt/etc/apt/sources.list.d/" \; 2>/dev/null || true
+    fi
+    if [[ -d /etc/apt/trusted.gpg.d ]]; then
+        find /etc/apt/trusted.gpg.d -maxdepth 1 -type f \( -name '*.gpg' -o -name '*.asc' \) \
+            -exec cp -n {} "$SIDEAPT_ROOT/apt/etc/apt/trusted.gpg.d/" \; 2>/dev/null || true
+    fi
+    if [[ -f /etc/apt/trusted.gpg && ! -e "$SIDEAPT_ROOT/apt/etc/apt/trusted.gpg" ]]; then
+        cp /etc/apt/trusted.gpg "$SIDEAPT_ROOT/apt/etc/apt/trusted.gpg" 2>/dev/null || true
+    fi
+
+    cat > "$APT_CONFIG_FILE" <<EOF
+Dir::State              "$SIDEAPT_ROOT/apt/var/lib/apt";
+Dir::State::Lists       "$SIDEAPT_ROOT/apt/var/lib/apt/lists";
+Dir::Cache              "$SIDEAPT_ROOT/apt/var/cache/apt";
+Dir::Cache::Archives    "$ARCHIVES_DIR";
+Dir::Etc                "$SIDEAPT_ROOT/apt/etc/apt";
+Dir::Etc::Trusted       "$SIDEAPT_ROOT/apt/etc/apt/trusted.gpg";
+Dir::Etc::TrustedParts  "$SIDEAPT_ROOT/apt/etc/apt/trusted.gpg.d";
+Dir::Etc::SourceList    "$SIDEAPT_ROOT/apt/etc/apt/sources.list";
+Dir::Etc::SourceParts   "$SIDEAPT_ROOT/apt/etc/apt/sources.list.d";
+Dir::Etc::Preferences   "$SIDEAPT_ROOT/apt/etc/apt/preferences";
+Dir::Etc::PreferencesParts "$SIDEAPT_ROOT/apt/etc/apt/preferences.d";
+Dir::Log                "$SIDEAPT_ROOT/apt/var/log/apt";
+APT::Architecture       "$ARCH";
+APT::Sandbox::User      "$(id -un)";
+EOF
+    mkdir -p "$SIDEAPT_ROOT/apt/var/log/apt"
+
+    log "initialized at $SIDEAPT_ROOT"
+    cat <<EOF
+
+Add this to ~/.bashrc to activate sideapt automatically:
+
+  command -v sideapt >/dev/null && eval "\$(sideapt env)"
+
+Then:
+
+  sideapt update                # fetch the private apt index
+  sideapt install <package>     # install something
+
+EOF
+}
+
+cmd_update() {
+    ensure_initialized
+    apt_env apt-get update
+}
+
+cmd_search() {
+    ensure_initialized
+    [[ $# -ge 1 ]] || die "usage: sideapt search <query>"
+    apt_env apt-cache search "$@" \
+        | while IFS=' ' read -r name rest; do
+            if is_installed_in_sideapt "$name"; then
+                printf '%s [installed] %s\n' "$name" "$rest"
+            else
+                printf '%s %s\n' "$name" "$rest"
+            fi
+        done
+}
+
+cmd_install() {
+    ensure_initialized
+    [[ $# -ge 1 ]] || die "usage: sideapt install <pkg>..."
+
+    local requested=("$@")
+    declare -A is_req=()
+    for r in "${requested[@]}"; do is_req[$r]=1; done
+
+    # Collect full dep set
+    local all=()
+    for pkg in "${requested[@]}"; do
+        log "resolving dependencies of $pkg"
+        local deps
+        deps=$(resolve_deps "$pkg")
+        [[ -z "$deps" ]] && die "package not found in apt cache: $pkg (did you run 'sideapt update'?)"
+        while IFS= read -r d; do
+            [[ -n "$d" ]] && all+=("$d")
+        done <<< "$deps"
+    done
+
+    # Filter out: already on system, already in sideapt
+    local need=()
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        is_installed_system "$p" && continue
+        is_installed_in_sideapt "$p" && continue
+        need+=("$p")
+    done < <(printf '%s\n' "${all[@]}" | sort -u)
+
+    if [[ ${#need[@]} -eq 0 ]]; then
+        log "nothing to install"
+        return 0
+    fi
+
+    log "downloading ${#need[@]} package(s): ${need[*]}"
+
+    # Download to a staging dir so we know exactly which .debs are new
+    local stage
+    stage=$(mktemp -d "$ARCHIVES_DIR/.stage-XXXXXX")
+    # shellcheck disable=SC2064
+    trap "rm -rf '$stage'" EXIT
+
+    if ! ( cd "$stage" && apt_env apt-get download "${need[@]}" ); then
+        die "apt-get download failed"
+    fi
+
+    shopt -s nullglob
+    local downloaded=( "$stage"/*.deb )
+    shopt -u nullglob
+
+    [[ ${#downloaded[@]} -gt 0 ]] || die "no .deb files were downloaded"
+
+    for deb in "${downloaded[@]}"; do
+        local name version
+        name=$(dpkg-deb -f "$deb" Package)
+        version=$(dpkg-deb -f "$deb" Version)
+
+        if is_installed_in_sideapt "$name"; then
+            log "skip $name (already in sideapt)"
+            continue
+        fi
+
+        log "extracting $name=$version"
+        dpkg-deb -x "$deb" "$SIDEAPT_ROOT/"
+
+        deb_file_list "$deb" > "$FILES_DIR/$name.list"
+
+        local kind=auto
+        [[ -n "${is_req[$name]+x}" ]] && kind=requested
+        printf '%s\t%s\t%s\t%s\n' \
+            "$name" "$version" "$(date -Iseconds)" "$kind" \
+            >> "$INSTALLED_TSV"
+    done
+
+    # Move cached .debs into the persistent archives dir
+    mv "$stage"/*.deb "$ARCHIVES_DIR/" 2>/dev/null || true
+
+    # Regenerate .so symlinks (ldconfig postinst replacement)
+    if command -v ldconfig >/dev/null; then
+        local libdirs=()
+        local d
+        for d in \
+            "$SIDEAPT_ROOT/usr/lib" \
+            "$SIDEAPT_ROOT/usr/lib/$MULTIARCH" \
+            "$SIDEAPT_ROOT/usr/lib64"; do
+            [[ -d "$d" ]] && libdirs+=("$d")
+        done
+        if [[ ${#libdirs[@]} -gt 0 ]]; then
+            ldconfig -n "${libdirs[@]}" 2>/dev/null || true
+        fi
+    fi
+
+    log "install complete"
+}
+
+cmd_remove() {
+    ensure_initialized
+    [[ $# -ge 1 ]] || die "usage: sideapt remove <pkg>..."
+
+    for pkg in "$@"; do
+        local list="$FILES_DIR/$pkg.list"
+        if [[ ! -f "$list" ]]; then
+            log "not installed: $pkg"
+            continue
+        fi
+        log "removing $pkg"
+
+        # Build the set of other packages' files for refcount
+        local other_lists=()
+        local f
+        shopt -s nullglob
+        for f in "$FILES_DIR"/*.list; do
+            [[ "$(basename "$f" .list)" != "$pkg" ]] && other_lists+=("$f")
+        done
+        shopt -u nullglob
+
+        while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            local owned_elsewhere=0
+            if [[ ${#other_lists[@]} -gt 0 ]]; then
+                if grep -Fxq -- "$file" "${other_lists[@]}" 2>/dev/null; then
+                    owned_elsewhere=1
+                fi
+            fi
+            if [[ $owned_elsewhere -eq 0 ]]; then
+                rm -f -- "$SIDEAPT_ROOT/$file"
+            fi
+        done < "$list"
+
+        rm -f "$list"
+
+        # Strip from installed.tsv atomically
+        local tmp
+        tmp=$(mktemp)
+        grep -v "^${pkg}	" "$INSTALLED_TSV" > "$tmp" || true
+        mv "$tmp" "$INSTALLED_TSV"
+    done
+
+    # Sweep empty dirs
+    find "$SIDEAPT_ROOT/usr" -type d -empty -delete 2>/dev/null || true
+}
+
+cmd_list() {
+    ensure_initialized
+    if [[ ! -s "$INSTALLED_TSV" ]]; then
+        log "no packages installed"
+        return 0
+    fi
+    printf '%-30s %-25s %-10s %s\n' NAME VERSION TYPE INSTALLED
+    while IFS=$'\t' read -r name version installed kind; do
+        printf '%-30s %-25s %-10s %s\n' "$name" "$version" "$kind" "$installed"
+    done < "$INSTALLED_TSV"
+}
+
+cmd_upgrade() {
+    ensure_initialized
+    [[ -s "$INSTALLED_TSV" ]] || { log "nothing installed"; return 0; }
+
+    local upgradable=()
+    local requested_pkgs=()
+    local all_installed=()
+
+    while IFS=$'\t' read -r name version _ kind; do
+        [[ -z "$name" ]] && continue
+        all_installed+=("$name")
+        [[ "$kind" = requested ]] && requested_pkgs+=("$name")
+
+        local candidate
+        candidate=$(apt_env apt-cache policy "$name" 2>/dev/null \
+            | awk '/Candidate:/ {print $2; exit}')
+        if [[ -n "$candidate" && "$candidate" != "(none)" ]]; then
+            if dpkg --compare-versions "$candidate" gt "$version" 2>/dev/null; then
+                upgradable+=("$name")
+                log "$name: $version -> $candidate"
+            fi
+        fi
+    done < "$INSTALLED_TSV"
+
+    if [[ ${#upgradable[@]} -eq 0 ]]; then
+        log "all packages up to date"
+        return 0
+    fi
+
+    if [[ ${#requested_pkgs[@]} -eq 0 ]]; then
+        log "no packages marked 'requested'; removing upgradables only"
+        cmd_remove "${upgradable[@]}"
+        return 0
+    fi
+
+    log "removing ${#all_installed[@]} installed package(s) and reinstalling requested set"
+    cmd_remove "${all_installed[@]}"
+    cmd_install "${requested_pkgs[@]}"
+}
+
+cmd_env() {
+    cat <<EOF
+export SIDEAPT_ROOT="$SIDEAPT_ROOT"
+export PATH="$SIDEAPT_ROOT/usr/bin:$SIDEAPT_ROOT/usr/sbin:$SIDEAPT_ROOT/usr/games:$SIDEAPT_ROOT/usr/local/bin:$SIDEAPT_ROOT/usr/local/sbin:\${PATH-}"
+export LD_LIBRARY_PATH="$SIDEAPT_ROOT/usr/lib/$MULTIARCH:$SIDEAPT_ROOT/usr/lib:\${LD_LIBRARY_PATH-}"
+export MANPATH="$SIDEAPT_ROOT/usr/share/man:\${MANPATH-}"
+export XDG_DATA_DIRS="$SIDEAPT_ROOT/usr/share:\${XDG_DATA_DIRS-/usr/local/share:/usr/share}"
+export PKG_CONFIG_PATH="$SIDEAPT_ROOT/usr/lib/$MULTIARCH/pkgconfig:$SIDEAPT_ROOT/usr/lib/pkgconfig:$SIDEAPT_ROOT/usr/share/pkgconfig:\${PKG_CONFIG_PATH-}"
+export CPATH="$SIDEAPT_ROOT/usr/include:\${CPATH-}"
+EOF
+}
+
+cmd_clean() {
+    ensure_initialized
+    rm -f "$ARCHIVES_DIR"/*.deb 2>/dev/null || true
+    rm -rf "$ARCHIVES_DIR"/.stage-* 2>/dev/null || true
+    log "archive cache cleaned"
+}
+
+usage() {
+    cat <<'EOF'
+sideapt — non-root APT-based package manager
+
+Usage: sideapt <command> [args]
+
+Commands:
+  init                Initialize ~/.sideapt and the private apt config
+  update              Refresh the private apt index (apt-get update)
+  search <query>      Search packages
+  install <pkg>...    Download .debs and extract under ~/.sideapt/usr
+  remove <pkg>...     Remove packages (refcount-aware)
+  list                List installed packages
+  upgrade             Upgrade installed packages
+  env                 Print shell snippet for activation:
+                        eval "$(sideapt env)"
+  clean               Remove cached .deb archives
+  help                Show this help
+
+Override location with SIDEAPT_ROOT (default ~/.sideapt).
+EOF
+}
+
+main() {
+    [[ $# -ge 1 ]] || { usage; exit 1; }
+    local cmd="$1"; shift
+    case "$cmd" in
+        init)             cmd_init "$@" ;;
+        update)           cmd_update "$@" ;;
+        search)           cmd_search "$@" ;;
+        install)          cmd_install "$@" ;;
+        remove|uninstall) cmd_remove "$@" ;;
+        list|ls)          cmd_list "$@" ;;
+        upgrade)          cmd_upgrade "$@" ;;
+        env)              cmd_env "$@" ;;
+        clean)            cmd_clean "$@" ;;
+        help|-h|--help)   usage ;;
+        *)                die "unknown command: $cmd (try 'sideapt help')" ;;
+    esac
+}
+
+main "$@"
